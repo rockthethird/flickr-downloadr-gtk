@@ -18,7 +18,7 @@ namespace FloydPink.Flickr.Downloadr.Logic
   {
     private static readonly Random Random = new Random((int) DateTime.Now.Ticks);
     private readonly IOriginalTagsLogic _originalTagsLogic;
-    private string _currentTimestampFolder;
+    private string _currentFolder;
 
     public DownloadLogic(IOriginalTagsLogic originalTagsLogic)
     {
@@ -34,11 +34,13 @@ namespace FloydPink.Flickr.Downloadr.Logic
     private async Task DownloadPhotos(IEnumerable<Photo> photos, CancellationToken cancellationToken, IProgress<ProgressUpdate> progress,
       Preferences preferences, Photoset photoset)
     {
+      var operationTest = "Downloading photos...";
+
       var progressUpdate = new ProgressUpdate
       {
         Cancellable = true,
-        OperationText = "Downloading photos...",
-        PercentDone = 0,
+        OperationText = operationTest,
+        Done = 0,
         ShowPercent = true
       };
       progress.Report(progressUpdate);
@@ -49,8 +51,24 @@ namespace FloydPink.Flickr.Downloadr.Logic
 
       var imageDirectory = CreateDownloadFolder(preferences.DownloadLocation, photoset);
 
+      var downloading = false;
       foreach (var photo in photosList)
       {
+        // Give the server a break
+        if(doneCount % 100 == 0 && downloading && doneCount > 0) {
+          // These could both be preferences
+          var delay = TimeSpan.FromMinutes(0.5); 
+          var interval = TimeSpan.FromSeconds(1);
+
+          while (delay > TimeSpan.FromTicks(0)){
+            progressUpdate.OperationText = $"Giving the server a break: {delay}";
+            progress.Report(progressUpdate);
+
+            await Task.Delay(interval);
+            delay = delay.Subtract(interval);
+          }
+        }
+        
         var photoUrl = photo.OriginalUrl;
         var photoExtension = "jpg";
         switch (preferences.DownloadSize)
@@ -67,26 +85,32 @@ namespace FloydPink.Flickr.Downloadr.Logic
             break;
         }
 
-        var photoWithPreferredTags = photo;
+        var photoName = preferences.TitleAsFilename ? GetSafeFilename(photo.Title) : photo.Id;
+        var targetFileName = Path.Combine(imageDirectory.FullName, string.Format("{0}.{1}", photoName, photoExtension));
 
+        // Was the photo already downloaded
+        var skipFileSize = 4096; // add to preferences maybe?
+        if (File.Exists(targetFileName) && new FileInfo(targetFileName).Length > skipFileSize) {
+          doneCount++;
+          continue;
+        }
+
+        downloading = true;
+
+        var photoWithPreferredTags = photo;
         if (preferences.NeedOriginalTags)
         {
           photoWithPreferredTags = await _originalTagsLogic.GetOriginalTagsTask(photo);
         }
-
-        var photoName = preferences.TitleAsFilename ? GetSafeFilename(photo.Title) : photo.Id;
-        var targetFileName = Path.Combine(imageDirectory.FullName,
-          string.Format("{0}.{1}", photoName, photoExtension));
         WriteMetaDataFile(photoWithPreferredTags, targetFileName, preferences);
 
         var request = WebRequest.Create(photoUrl);
-
         var buffer = new byte[4096];
-
         await DownloadAndSavePhoto(targetFileName, request, buffer);
 
-        doneCount++;
-        progressUpdate.PercentDone = doneCount*100/totalCount;
+        progressUpdate.OperationText = operationTest;
+        progressUpdate.Done = doneCount++;
+        progressUpdate.Total = totalCount;
         progressUpdate.DownloadedPath = imageDirectory.FullName;
         progress.Report(progressUpdate);
         if (doneCount != totalCount)
@@ -98,28 +122,33 @@ namespace FloydPink.Flickr.Downloadr.Logic
 
     private static async Task DownloadAndSavePhoto(string targetFileName, WebRequest request, byte[] buffer)
     {
-      using (var target = new FileStream(targetFileName, FileMode.Create, FileAccess.Write))
+      // Download file before creating the local copy (in case of exceptions)
+      using (var response = await request.GetResponseAsync())
       {
-        using (var response = await request.GetResponseAsync())
+        using (var stream = response.GetResponseStream())
         {
-          using (var stream = response.GetResponseStream())
+          using (var target = new FileStream(targetFileName, FileMode.Create, FileAccess.Write))
           {
             int read;
             while ((read = await stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
             {
               await target.WriteAsync(buffer, 0, read);
             }
+            target.Close();
           }
         }
       }
     }
 
-    private DirectoryInfo CreateDownloadFolder(string downloadLocation, Photoset currentPhotoset)
+    private DirectoryInfo CreateDownloadFolder(string downloadLocation, Photoset currentPhotoset, bool addTimeStamp = false)
     {
-      _currentTimestampFolder = string.Format("flickr-downloadr{0}-{1}", GetDownloadFolderNameForPhotoset(currentPhotoset),
-        GetSafeFilename(DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss")));
-      var imageDirectory =
-        Directory.CreateDirectory(Path.Combine(downloadLocation, _currentTimestampFolder));
+      _currentFolder = $"flickr-downloadr";
+
+      if(addTimeStamp)
+        _currentFolder += $"{GetDownloadFolderNameForPhotoset(currentPhotoset)}-{GetSafeFilename(DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss"))}";
+
+      var imageDirectory = Directory.CreateDirectory(Path.Combine(downloadLocation, _currentFolder));
+
       return imageDirectory;
     }
 
